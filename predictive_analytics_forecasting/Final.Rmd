@@ -1,0 +1,1392 @@
+---
+title: "Predictive_Analytics_Forecasting_Midterm"
+author: "Mike Luther"
+date: "10/18/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Get libraries
+```{r}
+library(tidyverse)
+library(fpp2)
+library(Hmisc)
+library(cowplot)
+library(bestglm)
+library(glmnet)
+library(car)
+library(caret)
+library(MASS)
+library(rcompanion)
+```
+
+
+Load in the data
+```{r}
+df <- read.csv("nba_shots.csv")
+df
+nrow(df)
+```
+There are 128,069 rows of data - deleting missing values should be fine. Will just need to see how many there are for a variable, and if they are in any way predictive. 
+
+What happens with a simple regression of just player on shot made?
+```{r}
+# test.reg <- glm(FGM ~ player_name + close_def_wingspan*close_def_height + CLOSE_DEF_DIST, data = df)
+# summary(test.reg)
+```
+How does the player shooting predict?
+```{r}
+# test.predict <- predict(test.reg, df, type = "response")
+# table(df$FGM, test.predict >= .5)
+```
+
+
+Explore existing variables - check for miscoded and missing values. Check distributions.
+
+Variable 1: Game ID - no value, will not use (SHOT_RESULT). There are 904 unique games represented. There are 30 teams that each play 82 games, but since 2 teams play each game, there should be 15x82 = 1,230. This data does appear to be missing information from 326 games. 
+```{r}
+df$GAME_ID <- as.factor(df$GAME_ID)
+str(df$GAME_ID)
+```
+
+
+Variable 2: MATCHUP: looks like "date - away team @ home team". Ex MAR 04, 2015 - CHA @ BKN
+
+Date may be helpful - potentially just for month, or for half of season.
+Probably most interesting thing would be what arena it is - split column that way.
+
+There are 30 levels and no missing values, so all is well with Arena. 
+
+No missing values for date. Let's make another column for month, and another for before and after the all star break. P > .05 for month. The all star game was played on February 15, 2015. 113,655 before, 14,414 after the break. 
+```{r}
+#Create column for Arena
+
+df$MATCHUP <- gsub("vs.", "@", df$MATCHUP)
+df
+#Now separate with @
+df <- separate(df, MATCHUP, into = c("matchup1", "Arena"), sep = "@", remove = FALSE)
+head(df)
+#let's see what happens at each stadium
+tapply(df$FGM, df$Arena, mean)
+summary(aov(df$FGM ~ df$Arena))
+df$Arena <- as.factor(df$Arena)
+str(df$Arena)
+sum(is.na(df$Arena))
+
+#Create time element
+df <- separate(df, matchup1, into = c("date", "away_team"), sep = "-", remove = FALSE)
+df[1:10,]
+sum(is.na(df$date))
+#month
+df <- separate(df, date, into = c("month", "day", "year"), sep = c(" "), fill = "right", remove = FALSE)
+df[1:10,]
+df$month <- as.factor(df$month)
+str(df$month)
+unique(df$month)
+#day has a comma - let's remove that
+df$day <- gsub(",", "", df$day)
+head(df)
+df$date1 <- as.Date(df$date, format = "%b %d, %Y" )
+head(df)
+df$allstar <- if_else(as.Date("02-15-2015", format = "%m-%d-%Y") > df$date1, "Before", "After")
+head(df)
+
+#Does month have any effect? 
+tapply(df$FGM, df$month, mean)
+summary(aov(df$FGM~df$month))
+
+#See if there were any differences before and after all star game? 
+tapply(df$FGM, df$allstar, mean)
+t.test(df$FGM~df$allstar)
+df %>% group_by(allstar) %>% tally()
+```
+
+
+Variable 3: Shooter home/away (LOCATION)
+
+No missing values. Home shooting percentage slightly higher. 
+```{r}
+summary(df$LOCATION)
+tapply(df$FGM, df$LOCATION, mean)
+t.test(df$FGM ~ df$LOCATION)
+```
+
+
+Variable 4: W/L (W) - since made shots influence wins, this variable could cause endongeneity issues. We see a very significant difference, but again, endogeneity.
+```{r}
+summary(df$W)
+tapply(df$FGM, df$W, mean)
+t.test(df$FGM~df$W)
+```
+
+
+Variable 5: FINAL_MARGIN - don't see this being useful. Again, endogeneity concerns. Looks normally distributed. 
+```{r}
+summary(df$FINAL_MARGIN)
+hist(df$FINAL_MARGIN)
+tapply(df$FINAL_MARGIN, df$FGM, mean)
+```
+
+
+Variable 6: SHOT_NUMBER - what number shot it was for a particular player in that game. Heavily right skewed. If used, will probably need some sort of transformation. 
+```{r}
+summary(df$SHOT_NUMBER)
+hist(df$SHOT_NUMBER)
+```
+
+
+Variable 7: PERIOD. This will be combined with game_clock to make a time elapsed variable. 
+```{r}
+summary(df$PERIOD)
+```
+
+
+
+Variable 8: GAME_CLOCK - will want to change this to time elapsed from start of game - will need to come up with function to combine this with period. No NAs, which is good. The mean of minutes passed makes sense - if shots are randomly dispersed and a game is 48 minutes, we would expect the average shot to be taken around the median point in the game, 24 minutes. Looking at the histogram, we see shots are taken with similar frequency throughout the course of games.  
+ 
+```{r}
+sum(is.na(df$GAME_CLOCK))
+
+#Need to multiply period by minute. However, we should convert all times on the clock to minutes
+df <- separate(df, GAME_CLOCK, into = c("period_minutes", "period_seconds"), sep = ":", remove = FALSE)
+#df
+
+#Now, convert period seconds into fractions of a minute. Need to convert to numeric first.
+#str(df$period_seconds)
+df$period_seconds <- as.numeric(df$period_seconds)
+df$period_minutes <- as.numeric(df$period_minutes)
+df$period_seconds <- df$period_seconds/60
+
+#Add seconds and minutes back together and multiply by quarter
+str(df$PERIOD)
+# df$minutes_elapsed <- if(df$PERIOD == 1){
+#   df$period_minutes + df$period_seconds
+# } else if(df$PERIOD == 2){
+#   12 + df$period_minutes + df$period_seconds
+# } else if(df$PERIOD==3){
+#   24 + df$period_minutes + df$period_seconds
+# } else if(df$PERIOD==4){
+#   36 + df$period_minutes + df$period_seconds
+# } else if(df$PERIOD==5){
+#   48 + df$period_minutes + df$period_seconds
+# } else if(df$PERIOD==6){
+#   60 + df$period_minutes + df$period_seconds
+# } else{
+#   72 + df$period_minutes + df$period_seconds
+# } 
+df$minutes_elapsed <- if_else(df$PERIOD == 1, df$period_minutes + df$period_seconds, if_else(df$PERIOD == 2, 12+ df$period_minutes + df$period_seconds, if_else(df$PERIOD == 3, 24+ df$period_minutes + df$period_seconds, if_else(df$PERIOD == 4, 36+ df$period_minutes + df$period_seconds, if_else(df$PERIOD == 5, 48+ df$period_minutes + df$period_seconds, if_else(df$PERIOD == 6, 60+ df$period_minutes + df$period_seconds,  72+ df$period_minutes + df$period_seconds))))))
+df
+summary(df$minutes_elapsed)
+hist(df$minutes_elapsed)
+```
+
+
+Variable 9: SHOT_CLOCK
+
+There are 5,567 NAs. The FG% for the non-NAs is 45.6%, and only 36.4% for those that missed. That is certainly a significant difference. However, it's not even 5% of the total observations. Should we impute? TBD.
+
+It looks relatively normally distributed, with a small spike towards the end of the clock - this makes sense. We can impute with the mean if we would like. 
+
+Also, the max is 24. Let's just assume that rather than saying it was released at 23.999...it was rounded to 24 - do not impute. 
+```{r}
+summary(df$SHOT_CLOCK)
+hist(df$SHOT_CLOCK)
+#There are 5,567 NAs. Let's investigate to see if we should impute, and if so, how. 
+tapply(df$FGM, is.na(df$SHOT_CLOCK), mean)
+t.test(df$FGM ~ is.na(df$SHOT_CLOCK))
+df$SHOT_CLOCK <- as.numeric(impute(df$SHOT_CLOCK, mean))
+summary(df$SHOT_CLOCK)
+sum(df$TOUCH_TIME == 24)
+```
+
+
+Variable 10: DRIBBLES - this is an interesting one. May be useful to characterize in 0 and more than 0 for catch and shoot. The t test shows a significantly lower amount of dribbles for made shots. This makes sense - unless they get the ball late in the shot clock and are forced to throw it up, shooting with less dribbles means they are more likely more open when they have the ball. Dribbles is heavily right skewed
+
+```{r}
+summary(df$DRIBBLES)
+hist(df$DRIBBLES)
+tapply(df$DRIBBLES, df$FGM, mean)
+boxplot(df$DRIBBLES~df$FGM)
+t.test(df$DRIBBLES ~ df$FGM)
+```
+
+
+Variable 11: TOUCH_TIME - should be highly correlated with DRIBBLES. May need to do some sort of interaction term if both used. Correlation with touch time = .914 - extremely high as suspected. Also heavily right skewed. Simlar story with touch time - less leads to a stat. significant increase in shot made. Should I define a "catch and shoot" variable...something like 0 dribbles and < 1 second touch time? Let's definitely use an interaction term - you could hold the ball in a mid post (think Kobe) and pump and jab step a lot and then shoot a contested shot.
+
+There are some issues here - we have negative values and a max value of over 24 seconds. Will need to impute these with the median or mean. 
+
+Most of the incorrectly coded times are negative, so I would assume that they were miscoded with a negative sign. 
+
+For the ones that are >24, I see two options. Replace with the mean, or move the decimal over one place - let's move the decimal over one place. 
+
+Now that this is done, everything looks good. The new max is 24, which also can't be right - even if it was someone dribbling down the clock and then chucking up a dumb shot to end the game, it should still be <24. It's just one value. Should I impute with the mean, or should I replace with 2.4? Staying consistent with above, let's assume that they rounded to 24 instead of logging 23.9999...for rounding purposes. It matches up with the one 24 value from shot clock.
+
+```{r}
+summary(df$TOUCH_TIME)
+cor(df$DRIBBLES, df$TOUCH_TIME)
+hist(df$TOUCH_TIME)
+tapply(df$TOUCH_TIME, df$FGM, mean)
+t.test(df$TOUCH_TIME~df$FGM)
+
+#vector of badness
+bad_touching <- c(df$TOUCH_TIME[df$TOUCH_TIME < 0], df$TOUCH_TIME[df$TOUCH_TIME > 24])
+bad_touching
+
+#Time to impute: make everything positive, move the decimal over one place
+df$TOUCH_TIME <- if_else(df$TOUCH_TIME < 0 , df$TOUCH_TIME * -1, df$TOUCH_TIME)
+df$TOUCH_TIME <- if_else(df$TOUCH_TIME > 24 , df$TOUCH_TIME/10, df$TOUCH_TIME)
+df
+summary(df$TOUCH_TIME)
+hist(df$TOUCH_TIME)
+sum(df$TOUCH_TIME == 24)
+```
+
+
+Variable 12: SHOT_DIST - very useful. Could be useful to factorize this into something like "close range", "mid-range", "long-mid-range", "3 pt", "long 3pt", "chuck". Not sure how to describe this distribution, but it's definitely not normal. Close baskets are definitely made more frequently. 
+
+I just arbitrarily said a long 3 was 5 feet beyond the arc - but is this necessarily the case? Let's see what the average 3 pointer was. 
+
+Also need to check the distances for all shot types - make sure that there are no 2s classified as 3s or vice versa. There are some messed up values that do need to be fixed. Assume that the distance is correct and the points type is misclassified.  
+```{r}
+summary(df$SHOT_DIST)
+hist(df$SHOT_DIST)
+str(df$SHOT_DIST)
+tapply(df$SHOT_DIST, df$FGM, mean)
+t.test(df$SHOT_DIST~df$FGM)
+boxplot(df$SHOT_DIST~df$FGM, notch = TRUE)
+
+#Check PTS_TYPE
+twos <- c(df$SHOT_DIST[df$PTS_TYPE ==2])
+threeptdist <- c(df$SHOT_DIST[df$PTS_TYPE ==3])
+sum(twos > 23.5) #338
+sum(threeptdist < 22) #872. 
+#Any 3 pointer is at least 23.5 feet
+df$PTS_TYPE[df$SHOT_DIST >= 23.5] <- 3
+#Any 2 pointer must be less than 22 feet.
+df$PTS_TYPE[df$SHOT_DIST < 22] <- 2
+summary(twos)
+summary(threeptdist)
+
+#factorize
+df$shot_type <- if_else(df$SHOT_DIST <= 8, "close_range", if_else(df$SHOT_DIST >8 & df$SHOT_DIST <= 15, "mid_range", if_else(df$SHOT_DIST >15 & df$SHOT_DIST<23.75 & df$PTS_TYPE == 2, "long_2pt", if_else(df$SHOT_DIST > 22 & df$SHOT_DIST <28.75 &  df$PTS_TYPE == 3, "3pt", "long_3"))))
+str(df$shot_type)
+df$shot_type <- as.factor(df$shot_type)
+df
+sum(df$shot_type == "long_3")
+
+#plot shot type
+shot_plot <- ggplot(df, aes(shot_type)) +
+  geom_bar(stat = "count")
+shot_plot
+
+#What is the FG% for each shot type? 
+tapply(df$FGM, df$shot_type, mean)
+ggplot(df, aes(shot_type, FGM))+
+  geom_bar(stat = "summary", fun.y = "mean")
+```
+
+
+Variable 13: PTS_TYPE - 2 or 3
+
+If I factorize distance, this will become redundant. Let's check it out in case I don't. Nothing appears awry with this.  
+```{r}
+summary(df$PTS_TYPE)
+t.test(df$FGM ~ df$PTS_TYPE)
+```
+
+
+Variable 14: SHOT_RESULT - dependent variable. Using FGM, this is redundant. 
+
+Variable 15: CLOSEST_DEFENDER - should be good. Also want to see if I can pull in wingspans and possibly verticals of these players. No missing values. 
+```{r}
+sum(is.na(df$CLOSEST_DEFENDER))
+```
+
+
+Variable 16: CLOSEST_DEFENDER_ID - redundant with CLOSEST_DEFENDER
+
+Variable 17: CLOSE_DEF_DIST - very useful. Potential interaction with wingspan. Although those two could be correlated. Maybe closest player height would be useful too. Heavily right-skewed. It's difficult to tell whether this is feet or inches - a max that high indicates inches, but the 3rd quartile is only 5.3, so that's saying that 75% of shots are taken with a defender within six inches, which seems unlikely. 
+
+```{r}
+summary(df$CLOSE_DEF_DIST)
+t.test(df$CLOSE_DEF_DIST~df$FGM)
+hist(df$CLOSE_DEF_DIST)
+```
+
+
+Variable 18: FGM - binary version of SHOT_RESULT. The mean is .4521 - let's just check to make sure that the sum of FGM = .4521 of the total rows (128,069). Checks out, no issues or NAs here. 
+```{r}
+summary(df$FGM)
+sum(df$FGM)/nrow(df)
+```
+
+
+Variable 19: PTS - resulting points from shot - not useful.
+
+Variable 20: player_name - name of shooter. May want to look at shooter height. No missing values. 
+
+```{r}
+sum(is.na(df$player_name))
+```
+
+
+Variable 21: player_id - not useful
+
+Manually Created Variables: 
+
+Variable 22: close_def_wingspan
+
+7,627 NAs. Slightly left skewed. How are we going to impute the NAs? Let's substitute with height - not perfect, and will be slightly biased since most wingspans are longer than the player is tall. 
+```{r}
+df$close_def_wingspan[df$close_def_wingspan == 0] <- NA
+summary(df$close_def_wingspan)
+hist(df$close_def_wingspan)
+#Impute missing values with height
+df$close_def_wingspan <- if_else(is.na(df$close_def_wingspan), df$close_def_height, df$close_def_wingspan)
+summary(df$close_def_wingspan)
+t.test(df$close_def_wingspan~df$FGM)
+```
+
+
+Variable 23: close_def_height
+
+Left skewed again. No NAs. Highly correlated with wingspan - interaction term? 
+```{r}
+df$close_def_height[df$close_def_height == 0] <- NA
+summary(df$close_def_height)
+t.test(df$close_def_height~df$FGM)
+hist(df$close_def_height)
+cor(df$close_def_height, df$close_def_wingspan)
+```
+
+
+Models:
+```{r}
+df
+```
+Let's create a new dataframe with only useful variables:
+
+month
+Arena
+LOCATION
+SHOT_NUMBER
+SHOT_CLOCK
+DRIBBLES
+TOUCH_TIME
+CLOSEST_DEFENDER
+CLOSE_DEF_DIST
+FGM
+player_name
+close_def_wingspan
+close_def_height
+allstar
+minutes_elapsed
+shot_type
+
+```{r}
+good_vars.df <- df[,c("month", "Arena", "LOCATION", "SHOT_NUMBER", "SHOT_CLOCK", "DRIBBLES", "TOUCH_TIME", "CLOSEST_DEFENDER", "CLOSE_DEF_DIST", "FGM", "player_name", "close_def_wingspan", "close_def_height", "allstar", "minutes_elapsed", "shot_type")]
+
+good_vars.df
+```
+First, need to split data into test and training sets. 
+```{r}
+set.seed(22)
+number.random <- sample.int(n = nrow(good_vars.df), size = floor(.80*nrow(good_vars.df)), replace = FALSE)
+train.sample <- good_vars.df[number.random,]
+test.sample <- good_vars.df[-number.random,]
+```
+
+Check out train and test samples. Samples look good! Time to model away!
+```{r}
+train.sample
+test.sample
+nrow(train.sample)
+nrow(test.sample)
+```
+
+
+Model 1: Try model with all variables. With factor variables, we now run into an issue where if they weren't in the train sample, we can't predict. It appears to only be an issue for closest defender though...let's just take that one out. 
+```{r}
+full.model <- glm(FGM~ .,data = train.sample[,!colnames(train.sample) %in% c("CLOSEST_DEFENDER")], family = "binomial")
+summary(full.model)
+```
+
+Check vif
+```{r}
+vif(full.model)
+```
+
+
+This model gives us an accuracy of ~61%. This is not much better than a guess, so there's definitely room to improve. 
+```{r}
+test.predict <- predict(full.model, test.sample, type = "response")
+table(test.sample$FGM, test.predict >= .5)
+```
+How can we improve?
+
+Let's first remove CLOSEST_DEFENDER. Also, I realized when trying to do best subset that allstar was not a factor. 
+```{r}
+train.sample <- select(train.sample, -CLOSEST_DEFENDER)
+test.sample <- select(test.sample, -CLOSEST_DEFENDER)
+train.sample$allstar <- as.factor(train.sample$allstar)
+test.sample$allstar <- as.factor(test.sample$allstar)
+train.sample
+test.sample
+```
+Before we try different things on the variables, let's do a full model that includes the interaction terms. Interaction between wingspan and height, and dribbles and touch time. 
+The model is about the same. What if we do a three-way interaction between wingspan, height, and distance? Same thing. Bummer. 
+```{r}
+model1a <- glm(FGM ~ month + Arena + LOCATION + SHOT_NUMBER + SHOT_CLOCK + DRIBBLES*TOUCH_TIME + player_name + CLOSE_DEF_DIST*close_def_wingspan*close_def_height + shot_type, family = "binomial", data = train.sample)
+
+test.predict <- predict(model1a, test.sample, type = "response")
+table(test.sample$FGM, test.predict >= .5)
+```
+
+Will an interaction term between shot type and defender distance help? Layups are converted a high percentage of the time, but they are more likely to be highly contested. About the same, does improve slightly. Interacting distance wit wingspan and height makes almost no difference, so let's not do this. Just have one more I want to look at - the original 3-way interaction.  
+```{r}
+interact_dist_shot_type <- glm(FGM ~ month + Arena + LOCATION + SHOT_NUMBER + SHOT_CLOCK + DRIBBLES*TOUCH_TIME + player_name + CLOSE_DEF_DIST*shot_type + close_def_wingspan*close_def_height, family = "binomial", data = train.sample)
+summary(interact_dist_shot_type)
+
+exp(coef(interact_dist_shot_type))
+
+pp <- predict(interact_dist_shot_type, test.sample, type = "response")
+table(test.sample$FGM, pp >= .5)
+
+#What about an interaction for distance in multiple areas?
+
+sup <- glm(FGM ~ month + Arena + LOCATION + SHOT_NUMBER + SHOT_CLOCK + DRIBBLES*TOUCH_TIME + player_name + CLOSE_DEF_DIST*shot_type + close_def_wingspan*close_def_height*CLOSE_DEF_DIST, family = "binomial", data = train.sample)
+summary(sup)
+
+pp2 <- predict(sup, test.sample, type = "response")
+table(test.sample$FGM, pp2 >= .5)
+
+yabo <- glm(FGM ~ month + Arena + LOCATION + SHOT_NUMBER + SHOT_CLOCK + DRIBBLES*TOUCH_TIME + player_name + shot_type + close_def_wingspan*close_def_height*CLOSE_DEF_DIST, family = "binomial", data = train.sample)
+summary(yabo)
+
+pp3 <- predict(yabo, test.sample, type = "response")
+table(test.sample$FGM, pp3 >= .5)
+```
+
+
+
+Different methods of variable selection
+
+Best subsets:
+
+In order to use the bestglm function, we need to alter the dataframe so that the last column is FGM. It's not working, perhaps too much data. So maybe best subsets won't work...try lasso. 
+```{r}
+# train.subset <- train.sample
+# train.subset$y <- train.sample$FGM
+# train.subset <- select(train.subset, c(-FGM, -player_name))
+# train.subset
+# 
+# #Best subset model - got an error saying everything had to be numeric or factor
+# bestsub <- bestglm(train.subset, family = binomial)
+# summary(bestsub)
+```
+
+Lasso Model:
+
+This performs even worse! The biggest issue seems to be the model under-predicts the amount of shots made. 
+```{r}
+#First, create matrix for both x and y
+lasso.x <- data.matrix(select(train.sample, -FGM))
+lasso.y <- data.matrix(select(train.sample, FGM))
+lasso.x
+lasso.y
+
+#Lasso graph showing approaching 0 as lambda increases. 
+approach.zero <- glmnet(lasso.x, lasso.y, family = "binomial", alpha = 1, lambda = seq(0,1,0.001))
+summary(approach.zero)
+plot(approach.zero)
+
+#Find lambda
+find.lambda <- cv.glmnet(lasso.x, lasso.y, family = "binomial", alpha = 1, lambda = seq(0,1,0.001))
+plot(find.lambda)
+lassolambda = find.lambda$lambda.min
+lassolambda
+
+#Fit the model on training data
+lasso.model <- glmnet(lasso.x, lasso.y, alpha = 1, family = "binomial", lambda = lassolambda)
+
+#Get the coefficients
+coef(lasso.model)
+
+#Predict on training data
+train_lasso.predict <- predict(lasso.model, lasso.x, type = "response")
+table(train.sample$FGM, train_lasso.predict >=.5)
+
+#Predict on test data
+test_lasso.x <- data.matrix(select(test.sample, -FGM))
+test_lasso.predict <- predict(lasso.model, test_lasso.x, type = "response")
+table(test.sample$FGM, test_lasso.predict >= .5)
+
+test_lasso.predict
+
+#Are there any residual diagnostics?
+#Can't do vif: there is no vcov() method for models of class lognet, glmnet
+```
+
+K-folds Cross Validation. Roughly the same as the other attempts to improve from the full model. 
+```{r}
+cv_model <- train(FGM ~ month + Arena + LOCATION + SHOT_NUMBER + SHOT_CLOCK + DRIBBLES*TOUCH_TIME + player_name + CLOSE_DEF_DIST + close_def_wingspan*close_def_height, method = "glm", family = "binomial", data = train.sample, 
+                  trControl = trainControl(method = "cv", number = 10, verboseIter = TRUE))
+summary(cv_model)
+```
+```{r}
+cv_predict <- predict(cv_model, test.sample)
+table(test.sample$FGM, cv_predict >=.5)
+```
+
+
+Transformations
+
+What can box-cox do for us? Box cox is one transformation applied to a whole model. Let's see if we can get this to work with our full model, and then try Tukey for individual variables as well. Book version didn't work, and  now being told that the response variable must be positive for Box Cox...makes since, since it transforms entire model equation. 
+
+Let's try Tukey instead - also getting an error saying sample size must be between 2 and 5,000. Looks like this will only work for individual players...so we're done here!
+```{r}
+#Create a df for numeric variables to transform
+#select was masked from dplyr. Let's get it back
+
+Tukeydf <- dplyr::select(train.sample, c(SHOT_NUMBER, SHOT_CLOCK, DRIBBLES, TOUCH_TIME, CLOSE_DEF_DIST, close_def_wingspan, close_def_height, minutes_elapsed))
+
+#Tukeydf dataframe looks good
+#But not working with apply function. Let's test it out on one variable first
+# for(l in 1:ncol(Tukeydf)){
+#   transformTukey(l, returnLambda = TRUE)
+# }
+transformTukey(Tukeydf$close_def_wingspan)
+```
+
+  
+Just out of curiosity, what happens with backwards selection? 
+```{r}
+backwards <- step(full.model, direction = "backward")
+summary(backwards)
+```
+Does backwards improve prediction at all? Nope - still about 61% accuracy rate
+
+```{r}
+back.predict <- predict(backwards, test.sample, type = "response")
+table(test.sample$FGM, back.predict >=.5)
+```
+
+Ok, time to pick 2 individual players and test them out!
+
+Player 1: LeBron James
+
+Create individual dataframe. 774 observations in train,  204 in test. About 20%, so good. 
+```{r}
+#train.sample
+lbj.train <- subset(train.sample, player_name == "lebron james")
+
+#test sample
+lbj.test <- subset(test.sample, player_name == "lebron james")
+lbj.test
+```
+Models
+
+1. Full Model. Similar accuracy, 60.78% on test data, 80.10% on training. 
+```{r}
+#Make model
+lbj1 <- glm(FGM ~., data = lbj.train[,!colnames(lbj.train) %in% c("player_name")], family = "binomial")
+summary(lbj1)
+
+#Predict on train
+lbj1train_predict <- predict(lbj1, lbj.train, type = "response")
+table(lbj.train$FGM, lbj1train_predict >=.5)
+
+#Predict on test
+lbj1test_predict <- predict(lbj1, lbj.test, type = "response")
+table(lbj.test$FGM, lbj1test_predict >=.5)
+exp(coef(lbj1))
+```
+
+
+2. Best model with interaction terms (height*wingspan, shot_type*closest defender)
+
+month, Arena, LOCATION, SHOT_NUMBER, SHOT_CLOCK, DRIBBLES, TOUCH_TIME, CLOSE_DEF_DIST, close_def_wingspan, close_def_height, allstar, minutes_elapsed, shot_type
+
+Slightly better test accuracy at 62.75%. Worse train accuracy at 66.14%. 
+```{r}
+lbj2 <- glm(FGM ~ month + Arena + LOCATION + SHOT_NUMBER + SHOT_CLOCK + DRIBBLES*TOUCH_TIME + CLOSE_DEF_DIST*shot_type + close_def_wingspan*close_def_height + allstar + minutes_elapsed, data = lbj.train, family = "binomial")
+summary(lbj2)
+
+#Predict on train
+lbj2train_predict <- predict(lbj2, lbj.train, type = "response")
+table(lbj.train$FGM, lbj2train_predict >=.5)
+
+#Predict on test
+lbj2test_predict <- predict(lbj2, lbj.test, type = "response")
+table(lbj.test$FGM, lbj2test_predict >=.5)
+```
+
+
+3. K-folds cross-validation of model2. One percent improvement in test accuracy: 63.73%. 62.27% train accuracy. 
+```{r}
+#Model
+lbj3 <- train(as.factor(FGM) ~ month + Arena + LOCATION + SHOT_NUMBER + SHOT_CLOCK + DRIBBLES*TOUCH_TIME + CLOSE_DEF_DIST*shot_type + close_def_wingspan*close_def_height + allstar + minutes_elapsed, method = "glm", family = "binomial", data = lbj.train, 
+                  trControl = trainControl(method = "cv", number = 10, verboseIter = TRUE))
+
+#Predict on train
+lbj1train_predict <- predict(lbj1, lbj.train)
+table(lbj.train$FGM, lbj1train_predict >=.5)
+
+#Predict on test
+lbj1test_predict <- predict(lbj1, lbj.test)
+table(lbj.test$FGM, lbj1test_predict >=.5)
+```
+
+
+4. Lasso model. Gets worse again. Test prediction goes down to 56.37%. Similar reason, doesn't predict many high probabilities, so a lot of predicted False's. It shrunk all besides SHOT_CLOCK
+```{r}
+#First, create matrix for both x and y
+lbj_lasso.x <- data.matrix(dplyr::select(lbj.train, -c(FGM, player_name)))
+lbj_lasso.y <- data.matrix(dplyr::select(lbj.train, FGM))
+#lbj_lasso.x
+#lbj_lasso.y
+
+#Lasso graph showing approaching 0 as lambda increases. 
+lbj_approach.zero <- glmnet(lbj_lasso.x, lbj_lasso.y, family = "binomial", alpha = 1, lambda = seq(0,1,0.001))
+summary(lbj_approach.zero)
+plot(lbj_approach.zero)
+
+#Find lambda
+lbj_find.lambda <- cv.glmnet(lbj_lasso.x, lbj_lasso.y, family = "binomial", alpha = 1, lambda = seq(0,1,0.001))
+plot(lbj_find.lambda)
+lbj_lassolambda = lbj_find.lambda$lambda.min
+lbj_lassolambda
+
+#Fit the model on training data
+lbj_lasso.model <- glmnet(lbj_lasso.x, lbj_lasso.y, alpha = 1, family = "binomial", lambda = lbj_lassolambda)
+
+#Get the coefficients
+coef(lbj_lasso.model)
+
+#Predict on training data
+lbj_train_lasso.predict <- predict(lbj_lasso.model, lbj_lasso.x, type = "response")
+table(lbj.train$FGM, lbj_train_lasso.predict >=.5)
+
+#Predict on test data
+lbj_test_lasso.x <- data.matrix(dplyr::select(lbj.test, -c(FGM, player_name)))
+lbj_test_lasso.predict <- predict(lbj_lasso.model, lbj_test_lasso.x, type = "response")
+table(lbj.test$FGM, lbj_test_lasso.predict >= .5)
+
+lbj_test_lasso.predict
+```
+
+
+5. Tukey model? Not sure why this isn't working, will have to try columns individually. 
+
+Slight improvement in test for tukey transformed with interactions: 64.22% accuracy.
+```{r}
+lbj_Tukeydf <- dplyr::select(lbj.train, c(SHOT_NUMBER, SHOT_CLOCK, DRIBBLES, TOUCH_TIME, CLOSE_DEF_DIST, close_def_wingspan, close_def_height, minutes_elapsed))
+lbj_Tukeydf
+
+lbj_Tukey.trans <- apply(lbj_Tukeydf, 2, transformTukey, returnLambda = TRUE)
+
+#Ok, that worked. Now, how do I access these? 
+#Shot number: .625 
+#Shot clock: .775
+#Dribbles: .475
+#touch time: .425
+#close_def_dist: .425
+#close_def_wingspan: .55
+#close_def_height: 2.4
+#minutes: .7
+
+lbj_tukey.model1 <- glm(FGM ~ month + Arena + LOCATION + I(SHOT_NUMBER^.625) + I(SHOT_CLOCK^.775) + I(DRIBBLES^.475) + I(TOUCH_TIME^.425) + I(CLOSE_DEF_DIST^.425) + shot_type + I(close_def_wingspan^.55) + I(close_def_height^2.4) + allstar + I(minutes_elapsed^.7), data = lbj.train, family = "binomial")
+summary(lbj_tukey.model1)
+
+lbj_tukey.model2 <- glm(FGM ~ month + Arena + LOCATION + I(SHOT_NUMBER^.625) + I(SHOT_CLOCK^.775) + I(DRIBBLES^.475*TOUCH_TIME^.425) + I(CLOSE_DEF_DIST^.425)*shot_type + I(close_def_wingspan^.55*close_def_height^2.4) + allstar + I(minutes_elapsed^.7), family = "binomial", data = lbj.train)
+summary(lbj_tukey.model2)
+
+lbjtukey1_predict <- predict(lbj_tukey.model1, lbj.train)
+table(lbj.train$FGM, lbjtukey1_predict >=.5)
+
+#Predict on test
+lbjtukeytest_predict <- predict(lbj_tukey.model1, lbj.test)
+table(lbj.test$FGM, lbjtukeytest_predict >=.5)
+
+lbjtukey2_predict <- predict(lbj_tukey.model2, lbj.train)
+table(lbj.train$FGM, lbjtukey2_predict >=.5)
+
+#Predict on test
+lbjtukeytest2_predict <- predict(lbj_tukey.model2, lbj.test)
+table(lbj.test$FGM, lbjtukeytest2_predict >=.5)
+
+```
+
+
+Player 2: Steph Curry
+
+Create individual dataframe. 786 observations in train. 182 in test. About 20%, so good. 
+```{r}
+#train sample
+curry.train <- subset(train.sample, player_name == "stephen curry")
+curry.train
+#test sample
+curry.test <- subset(test.sample, player_name == "stephen curry")
+curry.test
+```
+
+Models:
+
+1. Full Model. Interestingly, Melo doesn't have any games played  after the all star break. 58.24% test accuracy, 63.10% train accuracy. 
+```{r}
+#Make model
+curry1 <- glm(FGM ~., data = curry.train[,!colnames(lbj.train) %in% c("player_name")], family = "binomial")
+summary(curry1)
+
+#Predict on train
+curry1train_predict <- predict(curry1, curry.train, type = "response")
+table(curry.train$FGM, curry1train_predict >=.5)
+
+#Predict on test
+curry1test_predict <- predict(curry1, curry.test, type = "response")
+table(curry.test$FGM, curry1test_predict >=.5)
+exp(coef(curry1))
+```
+
+
+2. Best model with interaction terms (height*wingspan, shot_type*closest defender)
+
+Model actually gets slightly worse. 56.04% test accuracy. 
+```{r}
+curry2 <- glm(FGM ~ month + Arena + LOCATION + SHOT_NUMBER + SHOT_CLOCK + DRIBBLES*TOUCH_TIME + CLOSE_DEF_DIST*shot_type + close_def_wingspan*close_def_height + allstar + minutes_elapsed, data = curry.train, family = "binomial")
+summary(curry2)
+
+#Predict on train
+curry2train_predict <- predict(curry2, curry.train, type = "response")
+table(curry.train$FGM, curry2train_predict >=.5)
+
+#Predict on test
+curry2test_predict <- predict(curry2, curry.test, type = "response")
+table(curry.test$FGM, curry2test_predict >=.5)
+
+#Odds ratios
+exp(coef(curry2))
+```
+
+
+3. K-folds cross-validation of model2
+```{r}
+#Model
+curry3 <- train(as.factor(FGM) ~ month + Arena + LOCATION + SHOT_NUMBER + SHOT_CLOCK + DRIBBLES*TOUCH_TIME + CLOSE_DEF_DIST*shot_type + close_def_wingspan*close_def_height + allstar + minutes_elapsed, method = "glm", family = "binomial", data = curry.train, 
+                  trControl = trainControl(method = "cv", number = 10, verboseIter = TRUE))
+
+#Predict on train
+curry3train_predict <- predict(curry3, curry.train)
+table(curry.train$FGM, curry3train_predict >=.5)
+
+#Predict on test
+curry3test_predict <- predict(curry3, curry.test)
+table(curry.test$FGM, curry3test_predict >=.5)
+```
+
+
+4. Lasso model. Why did it predict everything as same probability of less than .5? Shrunk all coefficients to 0, so all that is left is an intercept term!
+```{r}
+#First, create matrix for both x and y
+curry_lasso.x <- data.matrix(dplyr::select(curry.train, -c(FGM, player_name)))
+curry_lasso.y <- data.matrix(dplyr::select(curry.train, FGM))
+#lbj_lasso.x
+#lbj_lasso.y
+
+#Lasso graph showing approaching 0 as lambda increases. 
+curry_approach.zero <- glmnet(curry_lasso.x, curry_lasso.y, family = "binomial", alpha = 1, lambda = seq(0,1,0.001))
+summary(curry_approach.zero)
+plot(curry_approach.zero)
+
+#Find lambda
+curry_find.lambda <- cv.glmnet(curry_lasso.x, curry_lasso.y, family = "binomial", alpha = 1, lambda = seq(0,1,0.001))
+plot(curry_find.lambda)
+curry_lassolambda = curry_find.lambda$lambda.min
+curry_lassolambda
+
+#Fit the model on training data
+curry_lasso.model <- glmnet(curry_lasso.x, curry_lasso.y, alpha = 1, family = "binomial", lambda = curry_lassolambda)
+
+#Get the coefficients
+coef(curry_lasso.model)
+
+#Predict on training data
+curry_train_lasso.predict <- predict(curry_lasso.model, curry_lasso.x, type = "response")
+table(curry.train$FGM, curry_train_lasso.predict >=.5)
+
+#Predict on test data
+curry_test_lasso.x <- data.matrix(dplyr::select(curry.test, -c(FGM, player_name)))
+curry_test_lasso.predict <- predict(curry_lasso.model, curry_test_lasso.x, type = "response")
+table(curry.test$FGM, curry_test_lasso.predict >= .5)
+
+curry_test_lasso.predict
+```
+
+
+5. Tukey model? 57.69% test accuracy for both. 
+```{r}
+curry_Tukeydf <- dplyr::select(curry.train, c(SHOT_NUMBER, SHOT_CLOCK, DRIBBLES, TOUCH_TIME, CLOSE_DEF_DIST, close_def_wingspan, close_def_height, minutes_elapsed))
+curry_Tukeydf
+
+curry_Tukey.trans <- apply(curry_Tukeydf, 2, transformTukey, returnLambda = TRUE)
+
+#Ok, that worked. Now, how do I access these? 
+#Shot number: .65 
+#Shot clock: 1.75
+#Dribbles: .575
+#touch time: .375
+#close_def_dist: .45
+#close_def_wingspan: .1
+#close_def_height: -3.175
+#minutes: .525
+
+curry_tukey.model1 <- glm(FGM ~ month + Arena + LOCATION + I(SHOT_NUMBER^.65) + I(SHOT_CLOCK^1.75) + I(DRIBBLES^.575) + I(TOUCH_TIME^.375) + I(CLOSE_DEF_DIST^.45) + shot_type + I(close_def_wingspan^.1) + I(close_def_height^-3.175) + allstar + I(minutes_elapsed^.525), data = curry.train, family = "binomial")
+summary(curry_tukey.model1)
+
+curry_tukey.model2 <- glm(FGM ~ month + Arena + LOCATION + I(SHOT_NUMBER^.65) + I(SHOT_CLOCK^1.75) + I(DRIBBLES^.575*TOUCH_TIME^.375) + I(CLOSE_DEF_DIST^.45)*shot_type + I(close_def_wingspan^.1*close_def_height^-3.175) + allstar + I(minutes_elapsed^.525), family = "binomial", data = curry.train)
+summary(curry_tukey.model2)
+
+currytukey1_predict <- predict(curry_tukey.model1, curry.train)
+table(curry.train$FGM, currytukey1_predict >=.5)
+
+#Predict on test
+currytukeytest_predict <- predict(curry_tukey.model1, curry.test)
+table(curry.test$FGM, currytukeytest_predict >=.5)
+
+currytukey2_predict <- predict(curry_tukey.model2, curry.train)
+table(curry.train$FGM, currytukey2_predict >=.5)
+
+#Predict on test
+currytukeytest2_predict <- predict(curry_tukey.model2, curry.test)
+table(curry.test$FGM, currytukeytest2_predict >=.5)
+```
+Try to get odds ratios:
+```{r}
+coef(curry_tukey.model2)
+exp(coef(curry_tukey.model2))
+#Example minutes_elapsed^.575
+#6.349043e-03
+.006349043^(1/.575)
+```
+In this example, the exponentiated coefficient on minutes_elapsed^.575 = .006349043. When raised to the 1/.575, we get an odds ratio of .006349043. 
+
+Simpler model. 64.84% accuracy. 
+```{r}
+simple.steph <- glm(FGM~ shot_type + CLOSE_DEF_DIST, family = "binomial", data = curry.train)
+summary(simple.steph)
+exp(coef(simple.steph))
+
+simple.pred <- predict(simple.steph, curry.test, type = "response")
+table(curry.test$FGM, simple.pred >=.5)
+```
+Ok, let's completely do this all over again for both LeBron and Steph!
+
+Here are the variables we will look at: Home/Away
+shot type*defender distance 
+wingspan*height
+dribbles*touch_time
+minutes (drop this second)
+allstar(drop this first)
+
+For bron, models 1 and 2 are identical in accuracy, model 3 is slightly better. 
+```{r}
+newbron1 <- glm(FGM ~ LOCATION + shot_type*CLOSE_DEF_DIST + close_def_wingspan*close_def_height + DRIBBLES*TOUCH_TIME + minutes_elapsed + allstar, family = "binomial", data = lbj.train)
+
+newbron2 <- glm(FGM ~ LOCATION + shot_type*CLOSE_DEF_DIST + close_def_wingspan*close_def_height + DRIBBLES*TOUCH_TIME + minutes_elapsed, family = "binomial", data = lbj.train)
+
+newbron3 <- glm(FGM ~ LOCATION + shot_type*CLOSE_DEF_DIST + close_def_wingspan*close_def_height + DRIBBLES*TOUCH_TIME, family = "binomial", data = lbj.train)
+
+exp(coef(newbron1))
+exp(coef(newbron2))
+exp(coef(newbron3))
+
+newbronpred1 <- predict(newbron1, lbj.test, type = "response")
+table(lbj.test$FGM, newbronpred1 >=.5)
+
+newbronpred2 <- predict(newbron2, lbj.test, type = "response")
+table(lbj.test$FGM, newbronpred2 >=.5)
+
+newbronpred3 <- predict(newbron3, lbj.test, type = "response")
+table(lbj.test$FGM, newbronpred3 >=.5)
+```
+
+Let's do the same thing for Steph! Similar story as LeBron: model 3 is slightly better, 1+2 are identical. Since 3 is simpler, it wins. Coefficients appear to make sense for both. 
+```{r}
+newsteph1 <- glm(FGM ~ LOCATION + shot_type*CLOSE_DEF_DIST + close_def_wingspan*close_def_height + DRIBBLES*TOUCH_TIME + minutes_elapsed + allstar, family = "binomial", data = curry.train)
+
+newsteph2 <- glm(FGM ~ LOCATION + shot_type*CLOSE_DEF_DIST + close_def_wingspan*close_def_height + DRIBBLES*TOUCH_TIME + minutes_elapsed, family = "binomial", data = curry.train)
+
+newsteph3 <- glm(FGM ~ LOCATION + shot_type*CLOSE_DEF_DIST + close_def_wingspan*close_def_height + DRIBBLES*TOUCH_TIME, family = "binomial", data = curry.train)
+
+exp(coef(newsteph1))
+exp(coef(newsteph2))
+exp(coef(newsteph3))
+
+newstephpred1 <- predict(newsteph1, curry.test, type = "response")
+table(curry.test$FGM, newstephpred1 >=.5)
+
+newstephpred2 <- predict(newsteph2, curry.test, type = "response")
+table(curry.test$FGM, newstephpred2 >=.5)
+
+newstephpred3 <- predict(newsteph3, curry.test, type = "response")
+table(curry.test$FGM, newstephpred3 >=.5)
+```
+
+Ok, that's good news! Model accuracy actually improved. Let's try this model 3 for all players, once including the shooter, and once not including the shooter. Both around 60%. Coefficients seem reasonable. 
+```{r}
+fullsimple.noshooter <- glm(FGM ~ LOCATION + shot_type*CLOSE_DEF_DIST + close_def_wingspan*close_def_height + DRIBBLES*TOUCH_TIME, family = "binomial", data = train.sample)
+
+fullsimple.shooter <- glm(FGM ~ LOCATION + shot_type*CLOSE_DEF_DIST + close_def_wingspan*close_def_height + DRIBBLES*TOUCH_TIME + player_name, family = "binomial", data = train.sample)
+
+exp(coef(fullsimple.noshooter))
+exp(coef(fullsimple.shooter))
+
+fullsimple.noshooter_predict <- predict(fullsimple.noshooter, test.sample)
+table(test.sample$FGM, fullsimple.noshooter_predict >=.5)
+
+fullsimple.shooter_predict <- predict(fullsimple.shooter, test.sample)
+table(test.sample$FGM, fullsimple.shooter_predict >=.5)
+```
+
+REORGANIZE DATA SET FOR FINAL
+```{r}
+```
+
+
+```{r}
+df
+```
+
+```{r}
+ppg_df <- df %>%
+  group_by(player_name, date1) %>%
+  summarise(ppg = sum(PTS))
+#ppg_df
+
+```
+
+```{r}
+lebron_df <- ppg_df %>%
+  subset(player_name == "lebron james")
+lebron_df
+```
+
+
+```{r}
+steph_df <- ppg_df %>%
+  subset(player_name == "stephen curry")
+steph_df
+```
+
+Let's try one more random player too that isn't as consistently good:
+
+```{r}
+lance_df <- ppg_df %>%
+  subset(player_name == "lance stephenson")
+lance_df
+```
+
+Convert to time series:
+```{r}
+lebron_df$date1 <- as.Date(lebron_df$date1, format = "%Y-%m-%d")
+lbj_ts <- ts(lebron_df)
+str(lbj_ts)
+lbj_ts2 <- ts(lebron_df$ppg) #this works. Would like to get the date as x-axis though. 
+autoplot(lbj_ts2)
+length(lbj_ts2)
+```
+LeBron's dataset contains 51 games. Let's make an 80/20 train/test split, and then try out some models. 
+
+```{r}
+lbj_train <- window(lbj_ts2, start = 1, end = 40)
+lbj_test <- window(lbj_ts2, start = 41, end = 51)
+
+autoplot(lbj_train) +
+  autolayer(lbj_test)
+
+length(lbj_ts2)
+length(lbj_train)
+length(lbj_test)
+
+mean(lbj_train)
+
+```
+
+Let's check acf and pacf plots to see if they offer us any indication of what model we should use. We can see that LeBron's ppg data is stationary, so we need no differencing or seasonality. we just need to determine how many lags to incorporate for the AR part of the model and how many error terms to use for the MA part of the model. 
+
+```{r}
+acf(lbj_ts2)
+pacf(lbj_ts2)
+```
+
+Only ACF 1 is significant. This indicates only perhaps an ARIMA (1,0,0)
+
+
+```{r}
+lbj_aa <- auto.arima(lbj_train)
+lbj_aa_fcst <- forecast::forecast(lbj_aa, h = 11)
+
+autoplot(lbj_aa_fcst) +
+  autolayer(lbj_test)
+
+length(lbj_aa_fcst)
+length(lbj_test)
+
+forecast::accuracy(lbj_aa_fcst, lbj_test)
+
+lbj_aa_fcst
+```
+Ok, auto.arima chose (0,0,0). Can we improve on MAE 6.20?
+
+```{r}
+lbj_arima1 <- arima(lbj_train, order = c(1,0,0))
+lbj_arima1_fcst <- forecast(lbj_arima1, h = 11)
+forecast::accuracy(lbj_arima1_fcst, lbj_test)
+```
+
+That actually got slightly worse (.02). Let's keep toying with the p and q arguments to see if we can get any improvements.
+
+```{r}
+lbj_arima1.1 <- arima(lbj_train, order = c(1,0,1))
+lbj_arima1.1_fcst <- forecast(lbj_arima1.1, h = 11)
+forecast::accuracy(lbj_arima1.1_fcst, lbj_test)
+```
+Worse again!
+
+```{r}
+lbj_arima2 <- arima(lbj_train, order = c(2,0,0))
+lbj_arima2_fcst <- forecast(lbj_arima2, h = 11)
+forecast::accuracy(lbj_arima2_fcst, lbj_test)
+```
+.01 worse
+
+```{r}
+lbj_arima2.1 <- arima(lbj_train, order = c(2,0,1))
+lbj_arima2.1_fcst <- forecast(lbj_arima2.1, h = 11)
+forecast::accuracy(lbj_arima2.1_fcst, lbj_test)
+```
+Almost identical to (2,0,0). .018 worse. 
+
+```{r}
+lbj_arima2.2 <- arima(lbj_train, order = c(2,0,2))
+lbj_arima2.2_fcst <- forecast(lbj_arima2.2, h = 11)
+forecast::accuracy(lbj_arima2.2_fcst, lbj_test)
+```
+Best one so far. Better than the (0,0,0) by .01. Let's try one more.
+
+```{r}
+lbj_arima3.3 <- arima(lbj_train, order = c(3,0,3))
+lbj_arima3.3_fcst <- forecast(lbj_arima3.3, h = 11)
+forecast::accuracy(lbj_arima3.3_fcst, lbj_test)
+
+autoplot(lbj_arima3.3_fcst) +
+  autolayer(lbj_test)
+
+lbj_arima3.3_fcst
+```
+Even more improvement: from 6.20 to 6.00. Might as well keep going.
+
+```{r}
+lbj_arima4.4 <- arima(lbj_train, order = c(4,0,4))
+lbj_arima4.4_fcst <- forecast(lbj_arima4.4, h = 11)
+forecast::accuracy(lbj_arima4.4_fcst, lbj_test)
+```
+
+Nope, wayyyyy worse. LeBron (3,0,3) wins
+
+```{r}
+lbj_arima5.5 <- arima(lbj_train, order = c(5,0,5))
+lbj_arima5.5_fcst <- forecast(lbj_arima5.5, h = 11)
+forecast::accuracy(lbj_arima5.5_fcst, lbj_test)
+```
+
+
+
+Chef time
+
+```{r}
+steph_df$date1 <- as.Date(steph_df$date1, format = "%Y-%m-%d")
+steph_ts <- ts(steph_df)
+str(steph_ts)
+steph_ts2 <- ts(steph_df$ppg) #this works. Would like to get the date as x-axis though. 
+autoplot(steph_ts2)
+length(steph_ts2)
+```
+
+```{r}
+steph_train <- window(steph_ts2, start = 1, end = 46)
+steph_test <- window(steph_ts2, start = 47, end = 58)
+length(steph_train)
+length(steph_test)
+
+autoplot(steph_train) +
+  autolayer(steph_test)
+
+mean(steph_train)
+
+```
+
+```{r}
+acf(steph_train)
+pacf(steph_train)
+```
+
+```{r}
+steph_aa <- auto.arima(steph_train)
+steph_aa_fcst <- forecast(steph_aa, h = 12)
+
+forecast::accuracy(steph_aa_fcst, steph_test)
+
+autoplot(steph_aa_fcst) + 
+  autolayer(steph_test)
+```
+
+Selected (0,0,0) again. Time to play around and see if we can improve on a test accuracy of 6.24 
+
+```{r}
+steph1.0 <- arima(steph_train, order = c(1,0,0))
+steph1.0_fcst <- forecast(steph1.0, h = 12)
+forecast::accuracy(steph1.0_fcst, steph_test)
+
+autoplot(steph1.0_fcst) + 
+  autolayer(steph_test)
+```
+MAE improves by .03 to 6.21
+
+```{r}
+steph1.1 <- arima(steph_train, order = c(1,0,1))
+steph1.1_fcst <- forecast(steph1.1, h = 12)
+forecast::accuracy(steph1.1_fcst, steph_test)
+
+autoplot(steph1.1_fcst) + 
+  autolayer(steph_test)
+```
+Even better - improves to 6.08.
+
+```{r}
+steph2.0 <- arima(steph_train, order = c(2,0,0))
+steph2.0_fcst <- forecast(steph2.0, h = 12)
+forecast::accuracy(steph2.0_fcst, steph_test)
+
+autoplot(steph2.0_fcst) + 
+  autolayer(steph_test)
+```
+Slightly worse again
+
+```{r}
+steph2.1 <- arima(steph_train, order = c(2,0,1))
+steph2.1_fcst <- forecast(steph2.1, h = 12)
+forecast::accuracy(steph2.1_fcst, steph_test)
+
+autoplot(steph2.1_fcst) + 
+  autolayer(steph_test)
+```
+
+Roughly the same as (2,0,0)
+
+```{r}
+steph2.2 <- arima(steph_train, order = c(2,0,2))
+steph2.2_fcst <- forecast(steph2.2, h = 12)
+forecast::accuracy(steph2.2_fcst, steph_test)
+
+autoplot(steph2.2_fcst) + 
+  autolayer(steph_test)
+```
+Best one yet - 6.06. Let's jump right to 3,0,3
+
+```{r}
+steph3.3 <- arima(steph_train, order = c(3,0,3))
+steph3.3_fcst <- forecast(steph3.3, h = 12)
+forecast::accuracy(steph3.3_fcst, steph_test)
+
+autoplot(steph3.3_fcst) + 
+  autolayer(steph_test)
+```
+Actually gets worse. Try 4,0,4, then move on
+
+```{r}
+steph4.4 <- arima(steph_train, order = c(4,0,4))
+steph4.4_fcst <- forecast(steph4.4, h = 12)
+forecast::accuracy(steph4.4_fcst, steph_test)
+
+autoplot(steph4.4_fcst) + 
+  autolayer(steph_test)
+```
+Best one yet by a lot - 5.84! Let's actually go all the way up to 6, because we see that lag as significant in both acf and pacf
+
+```{r}
+steph5.5 <- arima(steph_train, order = c(5,0,5))
+steph5.5_fcst <- forecast(steph5.5, h = 12)
+forecast::accuracy(steph5.5_fcst, steph_test)
+
+autoplot(steph5.5_fcst) + 
+  autolayer(steph_test)
+```
+Even more improvement! Down to 4.73!
+
+```{r}
+steph6.6 <- arima(steph_train, order = c(6,0,6))
+steph6.6_fcst <- forecast(steph6.6, h = 12)
+forecast::accuracy(steph6.6_fcst, steph_test)
+
+autoplot(steph6.6_fcst) + 
+  autolayer(steph_test)
+```
+Slightly worse - (5,0,5) wins. Time to move on to Lance. 
+
+```{r}
+lance_df$date1 <- as.Date(lance_df$date1, format = "%Y-%m-%d")
+lance_ts <- ts(lance_df)
+str(lance_ts)
+lance_ts2 <- ts(lance_df$ppg) #this works. Would like to get the date as x-axis though. 
+autoplot(lance_ts2)
+length(lance_ts2)
+```
+
+```{r}
+lance_train <- window(steph_ts2, start = 1, end = 36)
+lance_test <- window(steph_ts2, start = 37, end = 45)
+length(lance_train)
+length(lance_test)
+
+autoplot(lance_train) + 
+  autolayer(lance_test)
+
+mean(lance_train)
+
+
+```
+
+```{r}
+acf(lance_train)
+pacf(lance_train)
+```
+Significant ACF at lag 1, significant PACF at lags 1 and 6
+
+```{r}
+lance_aa <- auto.arima(lance_train)
+lance_aa_fcst <- forecast(lance_aa, h = 9)
+
+forecast::accuracy(lance_aa_fcst, lance_test)
+
+autoplot(lance_aa_fcst) +
+  autolayer(lance_test)
+
+
+```
+auto.arima again chose 0,0,0. MAE of 4.29 - the best MAE we've seen of any model for any player. 
+
+```{r}
+lance1.0 <- arima(lance_train, order = c(1,0,0))
+lance_1.0_fcst <- forecast(lance1.0, h = 9)
+
+forecast::accuracy(lance_1.0_fcst, lance_test)
+
+autoplot(lance_1.0_fcst) + 
+  autolayer(lance_test)
+```
+This improves MAE by about .2 t0 4.10
+
+```{r}
+lance1.1 <- arima(lance_train, order = c(1,0,1))
+lance_1.1_fcst <- forecast(lance1.1, h = 9)
+
+forecast::accuracy(lance_1.1_fcst, lance_test)
+
+autoplot(lance_1.1_fcst) + 
+  autolayer(lance_test)
+```
+Improves even more to 3.79.
+
+```{r}
+lance2.0 <- arima(lance_train, order = c(2,0,0))
+lance_2.0_fcst <- forecast(lance2.0, h = 9)
+
+forecast::accuracy(lance_2.0_fcst, lance_test)
+
+autoplot(lance_2.0_fcst) + 
+  autolayer(lance_test)
+```
+Worse
+
+```{r}
+lance2.1 <- arima(lance_train, order = c(2,0,1))
+lance_2.1_fcst <- forecast(lance2.1, h = 9)
+
+forecast::accuracy(lance_2.1_fcst, lance_test)
+
+autoplot(lance_2.1_fcst) + 
+  autolayer(lance_test)
+```
+Still not as good as 1,0,1
+
+```{r}
+lance2.2 <- arima(lance_train, order = c(2,0,2))
+lance_2.2_fcst <- forecast(lance2.2, h = 9)
+
+forecast::accuracy(lance_2.2_fcst, lance_test)
+
+autoplot(lance_2.2_fcst) + 
+  autolayer(lance_test)
+```
+Still not quite as good. 
+
+```{r}
+lance3.1 <- arima(lance_train, order = c(3,0,1))
+lance_3.1_fcst <- forecast(lance3.1, h = 9)
+
+forecast::accuracy(lance_3.1_fcst, lance_test)
+
+autoplot(lance_3.1_fcst) + 
+  autolayer(lance_test)
+```
+Nope
+
+```{r}
+lance3.3 <- arima(lance_train, order = c(3,0,3))
+lance_3.3_fcst <- forecast(lance3.3, h = 9)
+
+forecast::accuracy(lance_3.3_fcst, lance_test)
+
+autoplot(lance_3.3_fcst) + 
+  autolayer(lance_test)
+```
+Nope again.
+
+```{r}
+lance4.4 <- arima(lance_train, order = c(4,0,4))
+lance_4.4_fcst <- forecast(lance4.4, h = 9)
+
+forecast::accuracy(lance_4.4_fcst, lance_test)
+
+autoplot(lance_4.4_fcst) + 
+  autolayer(lance_test)
+```
+
+Best one yet - 3.66
+
+```{r}
+lance5.5 <- arima(lance_train, order = c(5,0,5))
+lance_5.5_fcst <- forecast(lance5.5, h = 9)
+
+forecast::accuracy(lance_5.5_fcst, lance_test)
+
+autoplot(lance_5.5_fcst) + 
+  autolayer(lance_test)
+```
+WOW - 2.53!!!
+
+```{r}
+lance6.6 <- arima(lance_train, order = c(6,0,6))
+lance_6.6_fcst <- forecast(lance6.6, h = 9)
+
+forecast::accuracy(lance_6.6_fcst, lance_test)
+
+autoplot(lance_6.6_fcst) + 
+  autolayer(lance_test)
+```
+
+About the same: .01 better, 2.52. Stop here!
